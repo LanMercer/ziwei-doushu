@@ -47,6 +47,35 @@ function AiContent({ text, streaming }: { text: string; streaming?: boolean }) {
   );
 }
 
+function VersionPill({
+  label,
+  active,
+  onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        fontSize: '11px',
+        padding: '4px 14px',
+        borderRadius: 'var(--r-pill)',
+        cursor: 'pointer',
+        transition: 'all 0.15s',
+        border: `1px solid ${active ? 'var(--ac-bdr)' : 'var(--bdr-med)'}`,
+        background: active ? 'var(--bg-card)' : 'transparent',
+        color: active ? 'var(--ac)' : 'var(--tx-3)',
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
 export default function HemingPage() {
   const router = useRouter();
   const { theme } = useTheme();
@@ -64,8 +93,16 @@ export default function HemingPage() {
   const [analyzing, setAnalyzing] = useState(false);
   const [question, setQuestion] = useState('');
   const [analysisError, setAnalysisError] = useState(false);
-  // 开源版不含 /api/heming：接口 404 时单独说明，而不是让用户反复重试
+  // 路由不存在（404）与需要访问口令（401）分开提示，避免误判
   const [apiMissing, setApiMissing] = useState(false);
+  const [needCode, setNeedCode] = useState(false);
+
+  // ─── 解读版本：专业版（默认）/ 简单版（按需改写）─────────────
+  const [version, setVersion] = useState<'pro' | 'simple'>('pro');
+  const [simpleText, setSimpleText] = useState('');
+  const [simpleAnalyzing, setSimpleAnalyzing] = useState(false);
+  const [simpleError, setSimpleError] = useState(false);
+  const versionRef = useRef<'pro' | 'simple'>('pro');
   const [formError, setFormError] = useState<string | null>(null);
   const analysisRef = useRef<HTMLDivElement>(null);
 
@@ -83,6 +120,54 @@ export default function HemingPage() {
   const isFormReady = (f: BirthFormState | null): boolean =>
     !!(f && f.year && f.month && f.day && f.gender && (f.unknownTime || (f.clockHour !== '' && f.clockMinute !== '')));
 
+  /** 把已有的专业版合盘分析改写成通俗版（按需调用，结果缓存在 simpleText） */
+  const runSimpleFrom = async (cA: ZiweiChart, cB: ZiweiChart, source: string) => {
+    setSimpleAnalyzing(true);
+    setSimpleError(false);
+    setSimpleText('');
+    try {
+      const code =
+        typeof window !== 'undefined' ? window.localStorage.getItem('ziwei-access-code') : null;
+      const res = await fetch('/api/heming', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(code ? { 'x-access-code': code } : {}),
+        },
+        body: JSON.stringify({ chartA: cA, chartB: cB, mode: 'simple', source }),
+      });
+      if (!res.ok || !res.body) throw new Error();
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let text = '';
+      let pendingLine = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pendingLine += decoder.decode(value, { stream: true });
+        const lines = pendingLine.split('\n');
+        pendingLine = lines.pop() ?? '';
+        for (const rawLine of lines) {
+          const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') break;
+          try {
+            const delta = JSON.parse(data).delta?.text ?? '';
+            text += delta;
+            setSimpleText(text);
+          } catch { /* skip */ }
+        }
+      }
+    } catch {
+      setSimpleError(true);
+    } finally {
+      setSimpleAnalyzing(false);
+    }
+  };
+
   // ─── 统一入口：起盘 + 合盘分析 ─────────────────────────────
   const runAnalysis = useCallback(async (q?: string) => {
     setFormError(null);
@@ -93,6 +178,10 @@ export default function HemingPage() {
     setAnalyzing(true);
     setAnalysis('');
     setAnalysisError(false);
+    setApiMissing(false);
+    setNeedCode(false);
+    setSimpleText('');
+    setSimpleError(false);
 
     try {
       // 每次按当前表单起盘，避免编辑出生信息后复用旧盘。
@@ -108,11 +197,17 @@ export default function HemingPage() {
       setChartA(cA);
       setChartB(cB);
 
+      const code =
+        typeof window !== 'undefined' ? window.localStorage.getItem('ziwei-access-code') : null;
       const res = await fetch('/api/heming', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(code ? { 'x-access-code': code } : {}),
+        },
         body: JSON.stringify({ chartA: cA, chartB: cB, question: q ?? undefined }),
       });
+      if (res.status === 401) { setNeedCode(true); throw new Error('need-code'); }
       if (res.status === 404) { setApiMissing(true); throw new Error('api-missing'); }
       if (!res.ok || !res.body) throw new Error();
 
@@ -141,12 +236,33 @@ export default function HemingPage() {
       }
       // scroll to analysis
       setTimeout(() => analysisRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
+
+      // 当前是简单版视图 → 专业版出来后自动补一份通俗版
+      if (versionRef.current === 'simple' && text) {
+        void runSimpleFrom(cA, cB, text);
+      }
     } catch {
       setAnalysisError(true);
     } finally {
       setAnalyzing(false);
     }
   }, [formA, formB, generateChart]);
+
+  const handleVersionChange = (next: 'pro' | 'simple') => {
+    if (analyzing) return; // 专业版还在生成时不允许切换，避免改写半截文本
+    if (next === version) {
+      // 已在简单版：生成失败时再点一次即重试
+      if (next === 'simple' && analysis && chartA && chartB && !simpleAnalyzing) {
+        void runSimpleFrom(chartA, chartB, analysis);
+      }
+      return;
+    }
+    setVersion(next);
+    versionRef.current = next;
+    if (next === 'simple' && analysis && !simpleText && !simpleAnalyzing && chartA && chartB) {
+      void runSimpleFrom(chartA, chartB, analysis);
+    }
+  };
 
   const cardStyle = {
     background: isDark ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.9)',
@@ -237,6 +353,18 @@ export default function HemingPage() {
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: (analysis || analyzing) ? '20px' : '24px' }}>
             <span style={{ color: 'var(--ac)', opacity: 0.6 }}>◉</span>
             <span style={{ fontSize: '11px', letterSpacing: '0.3em', color: 'var(--tx-3)' }}>合盘分析 · HEMING</span>
+            <div style={{ flex: 1 }} />
+            {analysis && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <span style={{ fontSize: '10px', color: 'var(--tx-3)', letterSpacing: '0.1em' }}>版本</span>
+                <VersionPill label="专业版" active={version === 'pro'} onClick={() => handleVersionChange('pro')} />
+                <VersionPill
+                  label={simpleAnalyzing ? '简单版 …' : '简单版'}
+                  active={version === 'simple'}
+                  onClick={() => handleVersionChange('simple')}
+                />
+              </div>
+            )}
           </div>
 
           {/* 状态分支 */}
@@ -280,13 +408,36 @@ export default function HemingPage() {
             </div>
           )}
 
-          {analysis && <AiContent text={analysis} streaming={analyzing} />}
+          {version === 'simple' && (simpleText || simpleAnalyzing) ? (
+            simpleText ? (
+              <AiContent text={simpleText} streaming={simpleAnalyzing} />
+            ) : (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '24px 0', color: 'var(--tx-3)', fontSize: '13px' }}>
+                <div style={{
+                  width: '14px', height: '14px',
+                  border: '2px solid var(--bdr-med)', borderTopColor: 'var(--ac)',
+                  borderRadius: '50%', animation: 'spin 0.8s linear infinite',
+                }} />
+                正在改写成通俗版…
+              </div>
+            )
+          ) : (
+            analysis && <AiContent text={analysis} streaming={analyzing} />
+          )}
+
+          {version === 'simple' && simpleError && (
+            <div style={{ marginTop: '12px', fontSize: '12px', color: '#dc2626' }}>
+              通俗版生成失败，点上方「简单版」重试。
+            </div>
+          )}
 
           {analysisError && (
             <div style={{ padding: '12px 16px', borderRadius: '10px', border: '1px solid var(--bdr)', background: 'var(--bg-card)', fontSize: '13px', color: 'var(--tx-2)', marginTop: '12px' }}>
               {apiMissing
-                ? '开源版不含合盘 AI 分析接口（/api/heming），需要你自己实现后才能用。两人的命盘可以分别到「排盘」页（/chart）查看。'
-                : '分析暂时不可用，请重试。'}
+                ? '合盘接口没找到（/api/heming 不存在）。确认文件 app/api/heming/route.ts 还在，并重启 npm run dev。'
+                : needCode
+                  ? '本站启用了访问口令。请先到「排盘」页的解读面板输入一次口令，再回到这里分析。'
+                  : '分析暂时不可用，请重试。'}
             </div>
           )}
         </div>

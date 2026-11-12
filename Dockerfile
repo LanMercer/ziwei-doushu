@@ -5,7 +5,10 @@
 FROM node:22-bookworm-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --include=dev --registry=https://registry.npmmirror.com
+# 注意：这里故意用 npm install 而不是 npm ci。
+# 仓库里的 package-lock.json 与 package.json 存在版本漂移（picomatch 2.3.2 / 4.0.7），
+# npm ci 遇到不一致会直接 EUSAGE 失败；npm install 会自动补齐并更新锁文件。
+RUN npm install --include=dev --no-audit --no-fund --registry=https://registry.npmmirror.com
 
 FROM node:22-bookworm-slim AS builder
 WORKDIR /app
